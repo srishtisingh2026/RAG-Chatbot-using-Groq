@@ -29,11 +29,21 @@ st.title("Groq RAG Chatbot")
 
 selected_model = st.selectbox("Select Model", AVAILABLE_MODELS)
 
+@st.cache_resource
+def get_session_counter():
+    return {"count": 0}
+
+session_counter = get_session_counter()
+
 if "session_id" not in st.session_state:
-    st.session_state["session_id"] = str(uuid.uuid4())
+    session_counter["count"] += 1
+    session_idx = session_counter["count"]
+    st.session_state["session_id"] = f"session-{session_idx:02d}"
+    st.session_state["user_id"] = f"user-{session_idx:02d}"
+    st.session_state["request_count"] = 0
 
 session_id = st.session_state["session_id"]
-user_id = hashlib.sha256(session_id.encode()).hexdigest()
+user_id = st.session_state["user_id"]
 
 # LLM
 llm = ChatGroq(
@@ -82,7 +92,8 @@ query = st.text_input("Ask a question about your documents")
 
 if st.button("Get Answer") and query:
 
-    request_id = str(uuid.uuid4())
+    st.session_state["request_count"] += 1
+    request_id = f"request-{st.session_state['request_count']:02d}"
 
     # Run RAG Engine and track latency
     start_time = time.time()
