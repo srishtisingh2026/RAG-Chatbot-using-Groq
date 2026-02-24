@@ -1,20 +1,11 @@
-# Environment variables
+
 .env
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Logs
-*.log
-
-# Virtual environments
 venv/
-.venv/
-
-# IDE
-.vscode/
-.idea/
+__pycache__/
+logs/
+faiss_index/
+.gemini/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints

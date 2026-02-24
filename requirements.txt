@@ -29,3 +29,5 @@ protobuf==4.25.3
 
 # Needed for FAISS + sentence_transformers backend
 torch==2.2.2
+
+tiktoken
