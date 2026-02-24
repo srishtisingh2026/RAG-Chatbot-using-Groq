@@ -6,6 +6,8 @@ import os
 import requests
 from datetime import datetime
 
+from azure.cosmos import CosmosClient, exceptions
+
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -27,22 +29,54 @@ class Telemetry:
 
     def __init__(self, backend_url=None):
         self.backend_url = backend_url
+        
+        # Cosmos DB Configuration
+        self.cosmos_conn = os.getenv("COSMOS_CONN_WRITE")
+        self.db_name = os.getenv("COSMOS_DB", "llmops-data")
+        self.container_name = "raw_traces"
+        
+        self.client = None
+        self.container = None
+        
+        if self.cosmos_conn:
+            try:
+                # Parse connection string for endpoint and key
+                endpoint = self.cosmos_conn.split("AccountEndpoint=")[1].split(";")[0]
+                key = self.cosmos_conn.split("AccountKey=")[1].split(";")[0]
+                
+                self.client = CosmosClient(endpoint, key)
+                db = self.client.get_database_client(self.db_name)
+                self.container = db.get_container_client(self.container_name)
+            except Exception as e:
+                print(f"Failed to initialize Cosmos DB client: {e}")
 
     def build_trace(self, data: dict, spans: list):
         trace = data.copy()
+        
+        # Ensure 'id' exists for Cosmos DB (using request_id)
+        if "request_id" in trace:
+            trace["id"] = trace["request_id"]
+        else:
+            trace["id"] = str(datetime.utcnow().timestamp())
+            
         trace["spans"] = spans
         trace["timestamp"] = datetime.utcnow().isoformat()
         return trace
 
     def log_trace(self, trace: dict):
+        # 1. Local logging
         logger.info(json.dumps(trace))
 
+        # 2. External Backend logging
         if self.backend_url:
             try:
-                requests.post(
-                    self.backend_url,
-                    json=trace,
-                    timeout=2
-                )
+                requests.post(self.backend_url, json=trace, timeout=2)
             except Exception:
                 pass
+                
+        # 3. Azure Cosmos DB logging
+        if self.container:
+            try:
+                self.container.create_item(body=trace)
+            except Exception as e:
+                print(f"Failed to log trace to Cosmos DB: {e}")

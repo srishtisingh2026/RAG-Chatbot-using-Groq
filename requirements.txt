@@ -31,3 +31,4 @@ protobuf==4.25.3
 torch==2.2.2
 
 tiktoken
+azure-cosmos==4.7.0
