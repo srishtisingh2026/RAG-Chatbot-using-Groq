@@ -49,7 +49,7 @@ user_id = st.session_state["user_id"]
 llm = ChatGroq(
     groq_api_key=groq_api_key,
     model_name=selected_model,
-    temperature=0,
+    temperature=0.3,
     max_tokens=200
 )
 
@@ -83,9 +83,8 @@ else:
 
 vector_store = get_vector_store(embeddings, index_mtime)
 
-retriever = vector_store.as_retriever(search_kwargs={"k": 2})
-
-rag_engine = RAGEngine(llm, retriever)
+# RAG Engine
+rag_engine = RAGEngine(llm, vector_store, k=2)
 telemetry = Telemetry(backend_url)
 
 query = st.text_input("Ask a question about your documents")
@@ -93,32 +92,42 @@ query = st.text_input("Ask a question about your documents")
 if st.button("Get Answer") and query:
 
     st.session_state["request_count"] += 1
-    request_id = f"request-{st.session_state['request_count']:02d}"
+    trace_id = f"trace-{st.session_state['request_count']:02d}"
 
-    # Run RAG Engine and track latency
-    start_time = time.time()
-    result = rag_engine.run(query, selected_model)
-    latency_ms = round((time.time() - start_time) * 1000, 2)
+    # Run RAG Engine with spinner
+    with st.spinner("Searching and generating answer..."):
+        start_time_ms = int(time.time() * 1000)
+        result = rag_engine.run(query)
 
-    # Consolidate flat log data
+    # Final Log Format
     log_data = {
-        "request_id": request_id,
+        "trace_id": trace_id,
+        "trace_name": result["trace_name"],
         "session_id": session_id,
         "user_id": user_id,
+        "timestamp": start_time_ms,
+        "environment": "dev",
+        "intent": result["intent"],
         "provider": "groq",
         "model": selected_model,
-        "input": query,
-        "output": result["output"],
-        "latency_ms": latency_ms,
-        "prompt_tokens": result["prompt_tokens"],
-        "completion_tokens": result["completion_tokens"],
-        "total_tokens": result["total_tokens"],
+        "input": {
+            "query": query
+        },
+        "output": {
+            "answer": result["output"]
+        },
+        "latency_ms": result["latency_ms"],
+        "documents_found": result["documents_found"],
+        "retrieval_executed": result["retrieval_executed"],
+        "retrieval_confidence": result["retrieval_confidence"],
+        "rag_data": result["rag_data"],
+        "spans": result["spans"],
+        "provider_raw": result["provider_raw"],
         "status": "success"
     }
 
-    # Build and log trace (with spans)
-    trace = telemetry.build_trace(log_data, result["spans"])
-    telemetry.log_trace(trace)
+    # Log trace
+    telemetry.log_trace(log_data)
 
     st.write(result["output"])
-    st.markdown(f"Total Tokens: {result['total_tokens']}")
+    st.markdown(f"Total Tokens: {result['usage']['total_tokens']}")

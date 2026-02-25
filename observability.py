@@ -1,12 +1,10 @@
 # observability.py
-
 import json
 import logging
 import os
 import requests
 from datetime import datetime
-
-from azure.cosmos import CosmosClient, exceptions
+from azure.cosmos import CosmosClient
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -50,20 +48,11 @@ class Telemetry:
             except Exception as e:
                 print(f"Failed to initialize Cosmos DB client: {e}")
 
-    def build_trace(self, data: dict, spans: list):
-        trace = data.copy()
-        
-        # Ensure 'id' exists for Cosmos DB (using request_id)
-        if "request_id" in trace:
-            trace["id"] = trace["request_id"]
-        else:
-            trace["id"] = str(datetime.utcnow().timestamp())
-            
-        trace["spans"] = spans
-        trace["timestamp"] = datetime.utcnow().isoformat()
-        return trace
-
     def log_trace(self, trace: dict):
+        # Ensure 'id' exists for Cosmos DB (using trace_id)
+        if "trace_id" in trace:
+            trace["id"] = trace["trace_id"]
+        
         # 1. Local logging
         logger.info(json.dumps(trace))
 
@@ -77,6 +66,6 @@ class Telemetry:
         # 3. Azure Cosmos DB logging
         if self.container:
             try:
-                self.container.create_item(body=trace)
+                self.container.upsert_item(body=trace)
             except Exception as e:
                 print(f"Failed to log trace to Cosmos DB: {e}")
