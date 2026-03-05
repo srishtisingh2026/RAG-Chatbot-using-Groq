@@ -6,6 +6,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores.utils import DistanceStrategy
 
 DATA_FOLDER = "Data"
 INDEX_FOLDER = "faiss_index"
@@ -50,10 +51,15 @@ def build_vector_store():
     texts = splitter.split_text("\n".join(documents))
 
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        encode_kwargs={"normalize_embeddings": True}
     )
 
-    vector_store = FAISS.from_texts(texts, embeddings)
+    vector_store = FAISS.from_texts(
+        texts, 
+        embeddings, 
+        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT
+    )
     vector_store.save_local(INDEX_FOLDER)
 
     print(f"Vector DB created successfully with {len(texts)} chunks.")

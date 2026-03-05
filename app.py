@@ -49,8 +49,8 @@ user_id = st.session_state["user_id"]
 llm = ChatGroq(
     groq_api_key=groq_api_key,
     model_name=selected_model,
-    temperature=0.3,
-    max_tokens=200
+    temperature=0.35,
+    max_tokens=300
 )
 
 # Vector DB
@@ -58,7 +58,8 @@ llm = ChatGroq(
 def get_embeddings():
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'}
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={"normalize_embeddings": True}
     )
 
 @st.cache_resource
@@ -84,7 +85,7 @@ else:
 vector_store = get_vector_store(embeddings, index_mtime)
 
 # RAG Engine
-rag_engine = RAGEngine(llm, vector_store, k=2)
+rag_engine = RAGEngine(llm, vector_store, k=3)
 telemetry = Telemetry(backend_url)
 
 query = st.text_input("Ask a question about your documents")
@@ -92,7 +93,7 @@ query = st.text_input("Ask a question about your documents")
 if st.button("Get Answer") and query:
 
     st.session_state["request_count"] += 1
-    trace_id = f"trace-{st.session_state['request_count']:02d}"
+    trace_id = f"trace-{uuid.uuid4().hex[:8]}"
 
     # Run RAG Engine with spinner
     with st.spinner("Searching and generating answer..."):
@@ -108,6 +109,7 @@ if st.button("Get Answer") and query:
         "timestamp": start_time_ms,
         "environment": "dev",
         "intent": result["intent"],
+        "routing_decision": result.get("routing_decision"),
         "provider": "groq",
         "model": selected_model,
         "input": {
