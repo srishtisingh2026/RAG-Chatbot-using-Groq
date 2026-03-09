@@ -2,9 +2,9 @@
 
 import streamlit as st
 import uuid
-import hashlib
-from dotenv import load_dotenv
+import time
 import os
+from dotenv import load_dotenv
 
 from langchain_groq import ChatGroq
 from langchain_community.vectorstores import FAISS
@@ -12,10 +12,14 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from rag_engine import RAGEngine
 from observability import Telemetry
-import time
 
+
+# ---------------------------------------------------------
 # Load ENV
+# ---------------------------------------------------------
+
 load_dotenv()
+
 groq_api_key = os.getenv("GROQ_API_KEY")
 backend_url = os.getenv("BACKEND_TRACE_URL")
 
@@ -29,107 +33,212 @@ st.title("Groq RAG Chatbot")
 
 selected_model = st.selectbox("Select Model", AVAILABLE_MODELS)
 
-@st.cache_resource
-def get_session_counter():
-    return {"count": 0}
 
-session_counter = get_session_counter()
+# ---------------------------------------------------------
+# Session Management (6-digit IDs)
+# ---------------------------------------------------------
 
 if "session_id" not in st.session_state:
-    session_counter["count"] += 1
-    session_idx = session_counter["count"]
-    st.session_state["session_id"] = f"session-{session_idx:02d}"
-    st.session_state["user_id"] = f"user-{session_idx:02d}"
+
+    short_id = uuid.uuid4().hex[:6]
+
+    st.session_state["session_id"] = f"session-{short_id}"
+    st.session_state["user_id"] = f"user-{short_id}"
     st.session_state["request_count"] = 0
 
 session_id = st.session_state["session_id"]
 user_id = st.session_state["user_id"]
 
+
+# ---------------------------------------------------------
 # LLM
+# ---------------------------------------------------------
+
 llm = ChatGroq(
     groq_api_key=groq_api_key,
     model_name=selected_model,
-    temperature=0.35,
+    temperature=0.25,
     max_tokens=300
 )
 
-# Vector DB
+
+# ---------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------
+
 @st.cache_resource
 def get_embeddings():
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'},
+        model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True}
     )
 
+embeddings = get_embeddings()
+
+
+# ---------------------------------------------------------
+# Vector Store
+# ---------------------------------------------------------
+
 @st.cache_resource
 def get_vector_store(_embeddings, last_updated):
+
     return FAISS.load_local(
         "faiss_index",
         _embeddings,
         allow_dangerous_deserialization=True
     )
 
-embeddings = get_embeddings()
 
-# Cache busting based on folder modification time
-if os.path.exists("faiss_index"):
-    index_mtime = os.path.getmtime("faiss_index")
-    import datetime
-    readable_mtime = datetime.datetime.fromtimestamp(index_mtime).strftime('%Y-%m-%d %H:%M:%S')
+if os.path.exists("faiss_index/index.faiss"):
+
+    index_mtime = os.path.getmtime("faiss_index/index.faiss")
+
+    from datetime import datetime
+
+    readable_mtime = datetime.fromtimestamp(index_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
     st.sidebar.info(f"Vector Index Last Updated: {readable_mtime}")
+
 else:
+
     index_mtime = 0
-    st.sidebar.warning("Vector index not found. Please run vectordb.py")
+    st.sidebar.warning("Vector index not found. Run vectordb.py first.")
+
 
 vector_store = get_vector_store(embeddings, index_mtime)
 
+
+# ---------------------------------------------------------
 # RAG Engine
-rag_engine = RAGEngine(llm, vector_store, k=3)
-telemetry = Telemetry(backend_url)
+# ---------------------------------------------------------
 
-query = st.text_input("Ask a question about your documents")
+@st.cache_resource
+def get_rag_engine(model_name, _llm, _vector_store):
 
-if st.button("Get Answer") and query:
+    return RAGEngine(_llm, _vector_store, k=3, distance_threshold=0.3)
 
+rag_engine = get_rag_engine(selected_model, llm, vector_store)
+
+
+# ---------------------------------------------------------
+# Telemetry
+# ---------------------------------------------------------
+
+@st.cache_resource
+def get_telemetry(url):
+    return Telemetry(url)
+
+telemetry = get_telemetry(backend_url)
+
+
+# ---------------------------------------------------------
+# User Input
+# ---------------------------------------------------------
+
+with st.form("query_form", clear_on_submit=False):
+    query = st.text_input(
+        "Ask a question about your documents",
+        key="query_input"
+    )
+    submitted = st.form_submit_button("Get Answer")
+
+
+# ---------------------------------------------------------
+# Run Query
+# ---------------------------------------------------------
+
+if submitted and query:
+
+    # Persist the submitted query so it stays visible after rerun
+    st.session_state["last_query"] = query
     st.session_state["request_count"] += 1
+
     trace_id = f"trace-{uuid.uuid4().hex[:8]}"
 
-    # Run RAG Engine with spinner
-    with st.spinner("Searching and generating answer..."):
+    # Show the question clearly above the spinner
+    st.markdown(f"**🧑 You asked:** {query}")
+
+    with st.spinner("🔍 Searching documents and generating answer..."):
+
         start_time_ms = int(time.time() * 1000)
+
         result = rag_engine.run(query)
 
-    # Final Log Format
+
+
+    # ---------------------------------------------------------
+    # Safe Defaults (prevent KeyErrors)
+    # ---------------------------------------------------------
+
+    documents_found = result.get("documents_found", 0)
+    retrieval_executed = result.get("retrieval_executed", False)
+    retrieval_confidence = result.get("retrieval_confidence", 0)
+    rag_data = result.get("rag_data", {})
+    spans = result.get("spans", [])
+    provider_raw = result.get("provider_raw", {})
+    trace_name = result.get("trace_name", "unknown")
+    intent = result.get("intent", "unknown")
+    latency = result.get("latency_ms", 0)
+
+
+    # ---------------------------------------------------------
+    # Trace Log
+    # ---------------------------------------------------------
+
     log_data = {
+
+        "id": trace_id,
+        "partitionKey": trace_id,
+
         "trace_id": trace_id,
-        "trace_name": result["trace_name"],
+        "trace_name": trace_name,
+
         "session_id": session_id,
         "user_id": user_id,
+
         "timestamp": start_time_ms,
         "environment": "dev",
-        "intent": result["intent"],
+
+        "intent": intent,
         "routing_decision": result.get("routing_decision"),
+
         "provider": "groq",
         "model": selected_model,
+
         "input": {
             "query": query
         },
+
         "output": {
-            "answer": result["output"]
+            "answer": result.get("output", "")
         },
-        "latency_ms": result["latency_ms"],
-        "documents_found": result["documents_found"],
-        "retrieval_executed": result["retrieval_executed"],
-        "retrieval_confidence": result["retrieval_confidence"],
-        "rag_data": result["rag_data"],
-        "spans": result["spans"],
-        "provider_raw": result["provider_raw"],
+
+        "latency_ms": latency,
+
+        "documents_found": documents_found,
+        "retrieval_executed": retrieval_executed,
+        "retrieval_confidence": retrieval_confidence,
+
+        "rag_data": rag_data,
+        "spans": spans,
+
+        "provider_raw": provider_raw,
+
         "status": "success"
     }
 
-    # Log trace
     telemetry.log_trace(log_data)
 
-    st.write(result["output"])
-    st.markdown(f"Total Tokens: {result['usage']['total_tokens']}")
+
+    # ---------------------------------------------------------
+    # Display Output
+    # ---------------------------------------------------------
+
+    st.markdown(f"**🤖 Answer:**")
+    st.write(result.get("output", "No response generated"))
+
+# Show last question if no new query is running
+elif st.session_state.get("last_query"):
+    st.info(f"Last question: {st.session_state['last_query']}")

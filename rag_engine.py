@@ -1,129 +1,299 @@
 import time
+import math
 import tiktoken
 import logging
 import hashlib
 import uuid
 import statistics
+from langchain_community.retrievers import BM25Retriever
+from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger("rag_logger")
 
 
 class RAGEngine:
 
-    def __init__(self, llm, vector_store, k=2, max_context_tokens=6000, distance_threshold=0.6):
+    def __init__(self, llm, vector_store, k=6, max_context_tokens=900, distance_threshold=0.5):
+
         self.llm = llm
         self.vector_store = vector_store
         self.k = k
-        self.enc = tiktoken.get_encoding("cl100k_base")
         self.max_context_tokens = max_context_tokens
         self.distance_threshold = distance_threshold
 
+        self.enc = tiktoken.get_encoding("cl100k_base")
+
+        print("Initializing BM25 index...")
+
+        all_docs = []
+        if hasattr(self.vector_store, "docstore"):
+            all_docs = list(self.vector_store.docstore._dict.values())
+
+        if all_docs:
+            self.bm25 = BM25Retriever.from_documents(all_docs)
+            self.bm25.k = 8
+        else:
+            self.bm25 = None
+
+        self.reranker = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            device="cpu"
+        )
+
+    # ---------------------------------------------------------
+    # Intent Classification
+    # ---------------------------------------------------------
+
     def classify_intent(self, query):
-        """Classifies the user query into basic categories."""
 
-        lower_query = query.lower().strip()
-        greetings = {"hi", "hello", "hii", "hey", "thanks", "thank you", "good morning", "good afternoon"}
+        greetings = {
+            "hi", "hello", "hey",
+            "thanks", "thank you",
+            "good morning", "good afternoon"
+        }
 
-        if lower_query in greetings:
+        if query.lower().strip() in greetings:
             return "greeting", {}
 
         prompt = f"""
-You are an AI intent classifier.
+Classify the intent.
 
-Label the query as exactly one of the following:
+Options:
 - greeting
 - search_query
 
 Query: "{query}"
 
-Return ONLY the label.
+Return only label.
 """
 
         response = self.llm.invoke(prompt)
 
-        intent_text = response.content.strip().lower()
-        usage = response.response_metadata.get("token_usage", {})
+        usage = response.response_metadata.get(
+            "token_usage", {}
+        ) if hasattr(response, "response_metadata") else {}
 
-        if "greeting" in intent_text:
+        if "greeting" in response.content.lower():
             return "greeting", usage
 
         return "search_query", usage
 
-    def retrieve_documents(self, query_vector):
-        """Retrieve documents and apply threshold + token truncation."""
+    # ---------------------------------------------------------
+    # Query Rewrite
+    # ---------------------------------------------------------
 
-        docs_with_scores = self.vector_store.similarity_search_with_score_by_vector(
-            query_vector,
-            k=self.k
+    def rewrite_query(self, query):
+
+        prompt = f"""
+Rewrite this query to improve document retrieval.
+
+Query:
+{query}
+
+Return only the rewritten query.
+"""
+
+        response = self.llm.invoke(prompt)
+
+        return response.content.strip()
+
+    # ---------------------------------------------------------
+    # Reciprocal Rank Fusion
+    # ---------------------------------------------------------
+
+    def reciprocal_rank_fusion(self, vector_docs, bm25_docs, k=60):
+
+        scores = {}
+
+        for rank, (doc, _) in enumerate(vector_docs):
+            key = doc.page_content
+            scores[key] = scores.get(key, 0) + 1 / (k + rank)
+
+        for rank, doc in enumerate(bm25_docs):
+            key = doc.page_content
+            scores[key] = scores.get(key, 0) + 1 / (k + rank)
+
+        merged = []
+
+        seen = {}
+
+        for doc, _ in vector_docs:
+            seen[doc.page_content] = doc
+
+        for doc in bm25_docs:
+            seen[doc.page_content] = doc
+
+        for content, score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+            merged.append(seen[content])
+
+        return merged
+
+    # ---------------------------------------------------------
+    # MMR Diversity Filter
+    # ---------------------------------------------------------
+
+    def mmr_filter(self, docs, query, lambda_param=0.7):
+
+        selected = []
+        seen = set()
+
+        for doc in docs:
+
+            text = doc.page_content[:200]
+
+            if text in seen:
+                continue
+
+            seen.add(text)
+            selected.append(doc)
+
+            if len(selected) >= self.k * 3:
+                break
+
+        return selected
+
+    # ---------------------------------------------------------
+    # Retrieval
+    # ---------------------------------------------------------
+
+    def retrieve_documents(self, query):
+
+        vector_docs = self.vector_store.similarity_search_with_score(
+            query,
+            k=self.k * 4
         )
 
+        bm25_docs = []
+        if self.bm25:
+            bm25_docs = self.bm25.get_relevant_documents(query)
+
+        fused_docs = self.reciprocal_rank_fusion(vector_docs, bm25_docs)
+
+        diversified_docs = self.mmr_filter(fused_docs, query)
+
+        if diversified_docs:
+
+            pairs = [[query, doc.page_content] for doc in diversified_docs]
+
+            rerank_scores = self.reranker.predict(pairs)
+
+            normalized_scores = [
+                1 / (1 + math.exp(-s))
+                for s in rerank_scores
+            ]
+
+            docs_with_scores = sorted(
+                zip(diversified_docs, normalized_scores),
+                key=lambda x: x[1],
+                reverse=True
+            )
+
+        else:
+            docs_with_scores = []
+
         truncated_docs = []
+
         current_tokens = 0
+        seen_parents = set()
 
         for doc, score in docs_with_scores:
-            if score >= self.distance_threshold:
-                doc_tokens = len(self.enc.encode(doc.page_content))
-                if current_tokens + doc_tokens <= self.max_context_tokens:
-                    truncated_docs.append((doc, score))
-                    current_tokens += doc_tokens
-                else:
-                    break
+
+            if score < self.distance_threshold:
+                continue
+
+            content = doc.metadata.get(
+                "parent_context",
+                doc.page_content
+            )
+
+            if content in seen_parents:
+                continue
+
+            tokens = len(self.enc.encode(content))
+
+            if tokens > self.max_context_tokens:
+                content = doc.page_content
+                tokens = len(self.enc.encode(content))
+
+            if current_tokens + tokens <= self.max_context_tokens:
+
+                doc.page_content = content
+
+                truncated_docs.append((doc, score))
+
+                current_tokens += tokens
+
+                seen_parents.add(content)
+
+            if len(truncated_docs) >= self.k:
+                break
 
         return truncated_docs, docs_with_scores
 
-    def generate_response(self, query, context, intent, routing_decision=None):
-        """Generate response using LLM."""
+    # ---------------------------------------------------------
+    # Generation
+    # ---------------------------------------------------------
+
+    def generate_response(self, query, context, intent, routing_decision):
 
         if intent == "greeting":
 
-            prompt = f"User: '{query}'. Respond with a short friendly greeting under 15 words."
+            prompt = f"""
+User: {query}
+
+Respond with a short friendly greeting.
+"""
 
         elif routing_decision == "out_of_scope":
 
-            prompt = f"User: '{query}'. Politely explain you only answer questions about the document base. Under 20 words."
+            prompt = f"""
+User: {query}
+
+Explain politely that you only answer questions about the provided documents.
+"""
 
         else:
 
             prompt = f"""
-You are a helpful knowledge assistant.
+You are a knowledge assistant.
 
-Provide a concise 1-2 sentence answer.
+Answer the question using the context below.
 
-Use the context below.
+If the answer can be reasonably inferred from the context, answer it.
 
-If the context is empty say you don't have that information.
+If the context clearly does not contain the answer say:
+"I don't have enough information in the provided documents."
 
 Context:
 {context}
 
 Question:
 {query}
+
+Maximum 2 sentences.
 """
 
         response = self.llm.invoke(prompt)
 
-        return (
-            response.content,
-            prompt,
-            response.response_metadata if hasattr(response, "response_metadata") else {}
-        )
+        metadata = response.response_metadata if hasattr(
+            response, "response_metadata") else {}
+
+        return response.content, prompt, metadata
+
+    # ---------------------------------------------------------
+    # Main Pipeline
+    # ---------------------------------------------------------
 
     def run(self, query):
 
         spans = []
 
-        start_time_ms = int(time.time() * 1000)
-
-        # -----------------------------
-        # 1 Intent Classification
-        # -----------------------------
-
-        intent_start = int(time.time() * 1000)
+        start = int(time.time() * 1000)
+        intent_start = start
 
         intent, intent_usage = self.classify_intent(query)
 
         intent_end = int(time.time() * 1000)
-
         spans.append({
             "span_id": f"span-intent-{uuid.uuid4().hex[:8]}",
             "type": "intent-classification",
@@ -135,48 +305,43 @@ Question:
             "usage": intent_usage
         })
 
-        retrieval_executed = False
         routing_decision = None
-        docs_found = 0
-        safe_docs = []
-        all_docs = []
+        trace_name = "simple-qa"
 
-        # -----------------------------
-        # 2 Retrieval
-        # -----------------------------
+        safe_docs = []
+
+        retrieval_executed = intent == "search_query"
 
         if intent == "search_query":
 
-            retrieval_executed = True
-
-            emb_start = int(time.time() * 1000)
-
-            query_vector = self.vector_store.embeddings.embed_query(query)
-
-            emb_end = int(time.time() * 1000)
-
-            spans.append({
-                "span_id": f"span-embedding-{uuid.uuid4().hex[:8]}",
-                "type": "embedding",
-                "name": "query-embedding",
-                "start_time": emb_start,
-                "end_time": emb_end,
-                "latency_ms": emb_end - emb_start,
-                "metadata": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
-            })
+            rewritten = self.rewrite_query(query)
 
             retrieval_start = int(time.time() * 1000)
 
-            safe_docs, all_docs = self.retrieve_documents(query_vector)
+            docs1, _ = self.retrieve_documents(query)
+            docs2, _ = self.retrieve_documents(rewritten)
 
             retrieval_end = int(time.time() * 1000)
 
-            docs_found = len(safe_docs)
+            combined = docs1 + docs2
 
-            best_score = None
+            unique = {}
 
-            if all_docs:
-                best_score = max(float(score) for _, score in all_docs)
+            for doc, score in combined:
+                key = doc.page_content
+                if key not in unique or score > unique[key][1]:
+                    unique[key] = (doc, score)
+
+            safe_docs = sorted(
+                unique.values(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:self.k]
+
+            best_score = max(
+                (float(score) for _, score in safe_docs),
+                default=None
+            )
 
             spans.append({
                 "span_id": f"span-retrieval-{uuid.uuid4().hex[:8]}",
@@ -186,158 +351,120 @@ Question:
                 "end_time": retrieval_end,
                 "latency_ms": retrieval_end - retrieval_start,
                 "metadata": {
-                    "documents_found": docs_found,
+                    "documents_found": len(safe_docs),
                     "best_score": round(best_score, 4) if best_score else None,
                     "threshold": self.distance_threshold
                 }
             })
 
-            if docs_found > 0:
+            if best_score and best_score >= self.distance_threshold:
                 routing_decision = "rag"
                 trace_name = "rag-qa"
             else:
                 routing_decision = "out_of_scope"
                 trace_name = "out-of-scope-qa"
 
-        elif intent == "greeting":
+        context = ""
 
-            trace_name = "simple-qa"
+        if routing_decision == "rag":
 
-        else:
+            context = "\n\n".join(
+                f"SOURCE {i+1}:\n{doc.page_content}"
+                for i, (doc, _) in enumerate(safe_docs)
+            )
 
-            trace_name = "unknown-qa"
+        llm_start = int(time.time() * 1000)
 
-        # -----------------------------
-        # 3 Generation
-        # -----------------------------
-
-        context = "\n\n".join([doc.page_content for doc, _ in safe_docs])
-
-        gen_start = int(time.time() * 1000)
-
-        output_text, used_prompt, provider_raw = self.generate_response(
+        output, used_prompt, provider_raw = self.generate_response(
             query,
             context,
             intent,
             routing_decision
         )
 
-        gen_end = int(time.time() * 1000)
-
+        llm_end = int(time.time() * 1000)
+        llm_usage = provider_raw.get("token_usage", {})
+        context_tokens = len(self.enc.encode(context)) if context else 0
         spans.append({
             "span_id": f"span-llm-{uuid.uuid4().hex[:8]}",
             "type": "llm",
             "name": "groq_chat_completion",
-            "start_time": gen_start,
-            "end_time": gen_end,
-            "latency_ms": gen_end - gen_start,
-            "metadata": {"temperature": 0.0},
-            "usage": provider_raw.get("token_usage", {})
+            "start_time": llm_start,
+            "end_time": llm_end,
+            "latency_ms": llm_end - llm_start,
+            "metadata": {
+                "temperature": 0.25,
+                "context_tokens": context_tokens
+            },
+            "usage": llm_usage
         })
 
-        # -----------------------------
-        # 4 Retrieval Score Statistics
-        # -----------------------------
-
-        scores = [float(score) for _, score in all_docs[:self.k]]
+        scores = [float(score) for _, score in safe_docs]
 
         if scores:
 
-            avg_score = sum(scores) / len(scores)
-            min_score = min(scores)
-            max_score = max(scores)
+            avg_score = statistics.mean(scores)
+
+            coverage = min(len(scores) / 3, 1)
+
             std_score = statistics.pstdev(scores) if len(scores) > 1 else 0
 
-            retrieval_confidence = round(avg_score, 4)
+            consistency = 1 / (1 + std_score)
+
+            retrieval_confidence = (
+                0.6 * avg_score +
+                0.25 * coverage +
+                0.15 * consistency
+            )
 
         else:
+            retrieval_confidence = 0
 
-            avg_score = None
-            min_score = None
-            max_score = None
-            std_score = None
-            retrieval_confidence = 0.0
-
-        rag_data = {
-
-            "retrieved_documents": [
-                {
-                    "doc_id": hashlib.md5(doc.page_content.encode()).hexdigest()[:8],
-                    "score": round(float(score), 4),
-                    "content_preview": doc.page_content[:200]
-                }
-                for doc, score in safe_docs
-            ],
-
-            "documents_found": docs_found,
-
-            "retrieval_scores": {
-                "avg_score": round(avg_score, 4) if avg_score is not None else None,
-                "min_score": round(min_score, 4) if min_score is not None else None,
-                "max_score": round(max_score, 4) if max_score is not None else None,
-                "std_score": round(std_score, 4) if std_score is not None else None,
-                "per_doc_scores": [round(float(s), 4) for s in scores]
-            },
-
-            "retrieval_confidence": retrieval_confidence
-        }
-
-        # -----------------------------
-        # Usage Aggregation
-        # -----------------------------
-
-        total_prompt_tokens = intent_usage.get("prompt_tokens", 0) + \
-            provider_raw.get("token_usage", {}).get("prompt_tokens", 0)
-
-        total_completion_tokens = intent_usage.get("completion_tokens", 0) + \
-            provider_raw.get("token_usage", {}).get("completion_tokens", 0)
-
-        total_latency = spans[-1]["end_time"] - spans[0]["start_time"]
-
-        # -----------------------------
-        # Final Trace Object
-        # -----------------------------
+        latency = int(time.time() * 1000) - start
 
         return {
 
-            "output": output_text,
+            "output": output,
             "context": context,
 
             "intent": intent,
             "routing_decision": routing_decision,
             "trace_name": trace_name,
 
-            "latency_ms": total_latency,
+            "latency_ms": latency,
 
-            "documents_found": docs_found,
             "retrieval_executed": retrieval_executed,
-
-            "retrieval_confidence": retrieval_confidence,
-
-            "rag_data": rag_data,
+            "documents_found": len(safe_docs),
+            "retrieval_confidence": round(retrieval_confidence, 4),
 
             "spans": spans,
+            "provider_raw": provider_raw,
 
-            "provider_raw": {
-                "id": provider_raw.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": provider_raw.get("model_name", "unknown"),
-                "choices": [
+            "rag_data": {
+
+                "documents_found": len(safe_docs),
+
+                "retrieval_scores": {
+                    "avg_score": round(avg_score, 4) if scores else 0,
+                    "min_score": round(min(scores), 4) if scores else 0,
+                    "max_score": round(max(scores), 4) if scores else 0,
+                    "std_score": round(std_score, 4) if len(scores) > 1 else 0,
+                    "per_doc_scores": [round(s, 4) for s in scores]
+                },
+
+                "retrieved_documents": [
+
                     {
-                        "message": {
-                            "role": "assistant",
-                            "content": output_text
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": provider_raw.get("token_usage", {})
-            },
+                        "doc_id": hashlib.md5(
+                            doc.page_content.encode()
+                        ).hexdigest()[:8],
 
-            "usage": {
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": total_prompt_tokens + total_completion_tokens
+                        "score": round(float(score), 4),
+
+                        "content_preview": doc.page_content
+                    }
+
+                    for doc, score in safe_docs
+                ]
             }
         }
