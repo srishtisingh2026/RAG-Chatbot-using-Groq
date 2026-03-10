@@ -11,7 +11,10 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from rag_engine import RAGEngine
-from observability import Telemetry
+import smartllmops
+import vectordb
+import pandas as pd
+from langchain_community.document_loaders import PyPDFLoader
 
 # ---------------------------------------------------------
 # Page Configuration
@@ -161,15 +164,6 @@ st.markdown("<div style='margin-bottom: 3rem;'></div>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------
-# Sidebar Configuration
-# ---------------------------------------------------------
-
-with st.sidebar:
-    st.markdown("### SETTINGS")
-    selected_model = st.selectbox("MODEL", AVAILABLE_MODELS)
-
-
-# ---------------------------------------------------------
 # Session Management (Silent)
 # ---------------------------------------------------------
 
@@ -203,7 +197,7 @@ def get_embeddings():
         encode_kwargs={"normalize_embeddings": True}
     )
 
-llm = init_llm(selected_model, groq_api_key)
+llm = init_llm(selected_model if "selected_model" in locals() else AVAILABLE_MODELS[0], groq_api_key)
 embeddings = get_embeddings()
 
 
@@ -231,17 +225,85 @@ vector_store = get_vector_store(embeddings, index_mtime)
 # ---------------------------------------------------------
 
 @st.cache_resource
-def get_rag_engine(model_name, _llm, _vector_store):
+def get_rag_engine_v2(model_name, _llm, _vector_store, _tracer):
     if not _vector_store:
         return None
-    return RAGEngine(_llm, _vector_store, k=3, distance_threshold=0.3)
+    return RAGEngine(_llm, _vector_store, tracer=_tracer, k=3, distance_threshold=0.3)
 
 @st.cache_resource
-def get_telemetry(url):
-    return Telemetry(url)
+def get_sdk_tracer_v2(url, salt="final_reboot_v10"):
+    return smartllmops.init(backend_url=url)
 
-rag_engine = get_rag_engine(selected_model, llm, vector_store)
-telemetry = get_telemetry(backend_url)
+sdk_tracer = get_sdk_tracer_v2(backend_url)
+rag_engine = get_rag_engine_v2(selected_model if "selected_model" in locals() else AVAILABLE_MODELS[0], llm, vector_store, sdk_tracer)
+
+
+# ---------------------------------------------------------
+# Sidebar Configuration
+# ---------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("### SETTINGS")
+    selected_model = st.selectbox("MODEL", AVAILABLE_MODELS)
+    
+    st.markdown("---")
+    st.markdown("### UPLOAD DOCUMENTS")
+    uploaded_files = st.file_uploader("Upload PDF, TXT or CSV", type=["pdf", "txt", "csv"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        if st.button("Process & Index Files"):
+            with st.spinner("Indexing new files..."):
+                new_docs = []
+                for uploaded_file in uploaded_files:
+                    # Save to Data directory
+                    if not os.path.exists("Data"):
+                        os.makedirs("Data")
+                    
+                    file_path = os.path.join("Data", uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    # Extract text based on type
+                    content = ""
+                    if uploaded_file.name.endswith(".pdf"):
+                        # We use PyPDFLoader for consistency with vectordb.py
+                        loader = PyPDFLoader(file_path)
+                        pdf_pages = loader.load()
+                        content = "\n".join([p.page_content for p in pdf_pages])
+                    elif uploaded_file.name.endswith(".txt"):
+                        content = uploaded_file.read().decode("utf-8")
+                    elif uploaded_file.name.endswith(".csv"):
+                        df = pd.read_csv(uploaded_file)
+                        content = df.astype(str).agg(" ".join, axis=1).str.cat(sep="\n")
+                    
+                    if content:
+                        chunks = vectordb.chunk_text(content, uploaded_file.name)
+                        new_docs.extend(chunks)
+                
+                if new_docs:
+                    # Load existing or create new
+                    if vector_store:
+                        vector_store.add_documents(new_docs)
+                    else:
+                        # Initialize new index
+                        emb_model = vectordb.get_embedding_model()
+                        vector_store = FAISS.from_documents(
+                            new_docs, 
+                            emb_model, 
+                            distance_strategy=vectordb.DistanceStrategy.MAX_INNER_PRODUCT
+                        )
+                    
+                    # Save updated index
+                    vector_store.save_local("faiss_index")
+                    st.success(f"Indexed {len(new_docs)} chunks!")
+                    st.info("Click 'Reload Engine' to apply changes.")
+    
+    st.markdown("---")
+    if st.button("Reload Engine"):
+        st.cache_resource.clear()
+        st.rerun()
+
+
 
 
 # ---------------------------------------------------------
@@ -272,6 +334,7 @@ if prompt := st.chat_input("Send prompt..."):
         with st.chat_message("assistant"):
             
             trace_id = f"trace-{uuid.uuid4().hex[:8]}"
+            sdk_tracer.start_trace()
             
             with st.spinner("Processing..."):
                 start_time_ms = int(time.time() * 1000)
@@ -312,15 +375,14 @@ if prompt := st.chat_input("Send prompt..."):
                 latency = result.get("latency_ms", 0)
                 docs = result.get("documents_found", 0)
                 
-                # Telemetry
-                telemetry.log_trace({
-                    "id": trace_id, "partitionKey": trace_id, "trace_id": trace_id,
-                    "session_id": session_id, "user_id": user_id,
-                    "timestamp": start_time_ms,
-                    "input": {"query": prompt}, "output": {"answer": answer},
-                    "latency_ms": latency, "documents_found": docs,
-                    "status": "success"
-                })
+                # Telemetry via SDK
+                sdk_tracer.export_trace(
+                    result, 
+                    query=prompt, 
+                    session_id=session_id, 
+                    user_id=user_id, 
+                    timestamp=start_time_ms
+                )
 
             # Display and store
             st.markdown(answer)
