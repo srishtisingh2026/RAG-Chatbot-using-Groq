@@ -14,6 +14,8 @@ from rag_engine import RAGEngine
 import smartllmops
 import vectordb
 import pandas as pd
+import httpx
+import groq
 from langchain_community.document_loaders import PyPDFLoader
 
 # ---------------------------------------------------------
@@ -161,6 +163,13 @@ AVAILABLE_MODELS = [
 st.markdown('<h1 style="font-weight: 800; font-size: 3rem; letter-spacing: -1.5px; color: #212529;">RAG Assistant</h1>', unsafe_allow_html=True)
 st.markdown("<div style='margin-bottom: 3rem;'></div>", unsafe_allow_html=True)
 
+# ---------------------------------------------------------
+# Sidebar - Early selection for model
+# ---------------------------------------------------------
+with st.sidebar:
+    st.markdown("### SETTINGS")
+    selected_model = st.selectbox("MODEL", AVAILABLE_MODELS)
+
 
 # ---------------------------------------------------------
 # Session Management (Silent)
@@ -181,11 +190,24 @@ user_id = st.session_state["user_id"]
 
 @st.cache_resource
 def init_llm(model_name, api_key):
+    # Create custom httpx clients with longer keepalive
+    sync_httpx = httpx.Client(
+        limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=300)
+    )
+    async_httpx = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=300)
+    )
+    
+    # Manually initialize groq clients to bypass langchain-groq validation bug
+    client = groq.Groq(api_key=api_key, http_client=sync_httpx).chat.completions
+    async_client = groq.AsyncGroq(api_key=api_key, http_client=async_httpx).chat.completions
+
     return ChatGroq(
-        groq_api_key=api_key,
         model_name=model_name,
         temperature=0.25,
-        max_tokens=300
+        max_tokens=300,
+        client=client,
+        async_client=async_client
     )
 
 @st.cache_resource
@@ -196,7 +218,7 @@ def get_embeddings():
         encode_kwargs={"normalize_embeddings": True}
     )
 
-llm = init_llm(selected_model if "selected_model" in locals() else AVAILABLE_MODELS[0], groq_api_key)
+llm = init_llm(selected_model, groq_api_key)
 embeddings = get_embeddings()
 
 
@@ -237,8 +259,8 @@ def get_sdk_tracer_v2(env, model, provider, salt="final_reboot_v11"):
         provider=provider
     )
 
-sdk_tracer = get_sdk_tracer_v2("dev", "llama-3.1-8b-instant", "groq")
-rag_engine = get_rag_engine_v2(selected_model if "selected_model" in locals() else AVAILABLE_MODELS[0], llm, vector_store, sdk_tracer)
+sdk_tracer = get_sdk_tracer_v2("dev", selected_model, "groq")
+rag_engine = get_rag_engine_v2(selected_model, llm, vector_store, sdk_tracer)
 
 
 # ---------------------------------------------------------
@@ -246,8 +268,6 @@ rag_engine = get_rag_engine_v2(selected_model if "selected_model" in locals() el
 # ---------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("### SETTINGS")
-    selected_model = st.selectbox("MODEL", AVAILABLE_MODELS)
     
     st.markdown("---")
     st.markdown("### UPLOAD DOCUMENTS")
@@ -302,6 +322,11 @@ with st.sidebar:
                     st.info("Click 'Reload Engine' to apply changes.")
     
     st.markdown("---")
+    if st.button("Sync Database"):
+        with st.spinner("Rebuilding index from Data folder..."):
+            vectordb.build_vector_store()
+            st.success("Database synced! Click 'Reload Engine' to apply.")
+
     if st.button("Reload Engine"):
         st.cache_resource.clear()
         st.rerun()

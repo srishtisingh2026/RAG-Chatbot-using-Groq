@@ -82,9 +82,12 @@ Return only label.
 
         response = self.llm.invoke(prompt)
 
-        usage = response.response_metadata.get(
-            "token_usage", {}
-        ) if hasattr(response, "response_metadata") else {}
+        metadata = getattr(response, "response_metadata", {})
+        usage = (
+            metadata.get("token_usage")
+            or metadata.get("usage_metadata")
+            or metadata
+        )
 
         if "greeting" in response.content.lower():
             return "greeting", usage
@@ -203,7 +206,7 @@ Return only the rewritten query.
                         ],
                         "scores": [
                             float(score)
-                            for _, score in r[0]
+                            for _, score in r[1]
                         ],
                         "threshold": self.distance_threshold
                     }
@@ -314,15 +317,15 @@ Return only the rewritten query.
         if self.tracer:
 
             @self.tracer.trace(
-                name="groq_chat_completion",
+                name=f"{getattr(self.tracer,'provider','llm')}_chat_completion",
                 span_type="llm",
                 include_io=False,
                 result_parser=lambda r, args, kwargs: {
                     "metadata": {
                         "temperature": 0.25,
-                        "context_tokens": len(self.enc.encode(args[1])) if len(args) > 1 else 0
+                        "context_tokens": len(self.enc.encode(args[1][:4000])) if len(args) > 1 else 0
                     },
-                    "usage": r[2].get("token_usage", r[2]) if isinstance(r[2], dict) else {}
+                    "usage": r[2] if isinstance(r[2], dict) else {}
                 }
             )
             def wrapped(q, c, i, r):
