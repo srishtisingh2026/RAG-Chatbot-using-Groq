@@ -2,26 +2,47 @@ import time
 import math
 import tiktoken
 import logging
+import sys
 from langchain_community.retrievers import BM25Retriever
 from sentence_transformers import CrossEncoder
+import functools
 
 logger = logging.getLogger("rag_logger")
+
+
+def smart_trace(span_type, name=None):
+    """Declarative trace decorator that finds the tracer on the instance (self)."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if hasattr(self, "tracer") and self.tracer:
+                span_name = name or func.__name__
+                # Dynamic name for LLM spans
+                if span_type == "llm" and "{provider}" in span_name:
+                    provider = getattr(self.tracer, "provider", "llm")
+                    span_name = span_name.format(provider=provider)
+                
+                return self.tracer.trace(
+                    name=span_name, 
+                    span_type=span_type,
+                    include_io=False
+                )(func)(self, *args, **kwargs)
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class RAGEngine:
 
     def __init__(self, llm, vector_store, tracer=None, k=6, max_context_tokens=2000, distance_threshold=0.60):
-
         self.llm = llm
         self.vector_store = vector_store
         self.tracer = tracer
         self.k = k
         self.max_context_tokens = max_context_tokens
         self.distance_threshold = distance_threshold
-
+        
         self.enc = tiktoken.get_encoding("cl100k_base")
-
-        print("Initializing BM25 index...")
 
         all_docs = []
         if hasattr(self.vector_store, "docstore"):
@@ -32,7 +53,7 @@ class RAGEngine:
             self.bm25.k = 8
         else:
             self.bm25 = None
-
+        
         self.reranker = CrossEncoder(
             "cross-encoder/ms-marco-MiniLM-L-6-v2",
             device="cpu",
@@ -43,30 +64,8 @@ class RAGEngine:
     # Intent Classification
     # ---------------------------------------------------------
 
+    @smart_trace(span_type="intent-classification", name="intent-classifier")
     def classify_intent(self, query):
-
-        if self.tracer:
-            return self._classify_intent_wrapped(query)
-
-        return self._classify_intent_raw(query)
-
-    def _classify_intent_wrapped(self, query):
-
-        @self.tracer.trace(
-            name="intent-classifier",
-            span_type="intent-classification",
-            include_io=False,
-            result_parser=lambda r, args, kwargs: {
-                "metadata": {"intent": r[0]},
-                "usage": r[1]
-            }
-        )
-        def wrapped(q):
-            return self._classify_intent_raw(q)
-
-        return wrapped(query)
-
-    def _classify_intent_raw(self, query):
 
         prompt = f"""
 Classify the intent.
@@ -98,26 +97,8 @@ Return only label.
     # Query Rewrite
     # ---------------------------------------------------------
 
+    @smart_trace(span_type="chain", name="query-rewrite")
     def rewrite_query(self, query):
-
-        if self.tracer:
-
-            @self.tracer.trace(
-                name="query-rewrite",
-                span_type="chain",
-                include_io=False,
-                result_parser=lambda r, args, kwargs: {
-                    "metadata": {"rewritten_query": r}
-                }
-            )
-            def wrapped(q):
-                return self._rewrite_query_raw(q)
-
-            return wrapped(query)
-
-        return self._rewrite_query_raw(query)
-
-    def _rewrite_query_raw(self, query):
 
         prompt = f"""
 INSTRUCTION: Rewrite the user's query into a descriptive natural language search phrase to improve vector document retrieval.
@@ -194,36 +175,8 @@ Rewritten Phrase:
     # Retrieval
     # ---------------------------------------------------------
 
+    @smart_trace(span_type="retrieval", name="vector-search")
     def retrieve_documents(self, query):
-
-        if self.tracer:
-
-            @self.tracer.trace(
-                name="vector-search",
-                span_type="retrieval",
-                include_io=False,
-                result_parser=lambda r, args, kwargs: {
-                    "metadata": {
-                        "documents": [
-                            {"content_preview": doc.page_content}
-                            for doc, _ in r[0]
-                        ],
-                        "scores": [
-                            float(score)
-                            for _, score in r[1]
-                        ],
-                        "threshold": self.distance_threshold
-                    }
-                }
-            )
-            def wrapped(q):
-                return self._retrieve_documents_raw(q)
-
-            return wrapped(query)
-
-        return self._retrieve_documents_raw(query)
-
-    def _retrieve_documents_raw(self, query):
 
         vector_docs = self.vector_store.similarity_search_with_score(
             query,
@@ -313,30 +266,8 @@ Rewritten Phrase:
     # Generation
     # ---------------------------------------------------------
 
+    @smart_trace(span_type="llm", name="{provider}_chat_completion")
     def generate_response(self, query, context, intent, routing_decision):
-
-        if self.tracer:
-
-            @self.tracer.trace(
-                name=f"{getattr(self.tracer,'provider','llm')}_chat_completion",
-                span_type="llm",
-                include_io=False,
-                result_parser=lambda r, args, kwargs: {
-                    "metadata": {
-                        "temperature": 0.25,
-                        "context_tokens": len(self.enc.encode(args[1][:4000])) if len(args) > 1 else 0
-                    },
-                    "usage": r[2] if isinstance(r[2], dict) else {}
-                }
-            )
-            def wrapped(q, c, i, r):
-                return self._generate_response_raw(q, c, i, r)
-
-            return wrapped(query, context, intent, routing_decision)
-
-        return self._generate_response_raw(query, context, intent, routing_decision)
-
-    def _generate_response_raw(self, query, context, intent, routing_decision):
 
         if intent == "greeting":
 
@@ -383,18 +314,8 @@ Response:
     # Main Pipeline
     # ---------------------------------------------------------
 
+    @smart_trace(span_type="generic", name="rag-pipeline")
     def run(self, query):
-        if self.tracer:
-
-            @self.tracer.trace(name="rag-pipeline")
-            def wrapped_run(q):
-                return self._run_raw(q)
-
-            return wrapped_run(query)
-
-        return self._run_raw(query)
-
-    def _run_raw(self, query):
 
         intent, _ = self.classify_intent(query)
 
