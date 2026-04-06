@@ -10,22 +10,18 @@ import functools
 logger = logging.getLogger("rag_logger")
 
 
-def smart_trace(span_type, name=None):
+def smart_trace(span_type, name=None, include_io=False):
     """Declarative trace decorator that finds the tracer on the instance (self)."""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             if hasattr(self, "tracer") and self.tracer:
                 span_name = name or func.__name__
-                # Dynamic name for LLM spans
-                if span_type == "llm" and "{provider}" in span_name:
-                    provider = getattr(self.tracer, "provider", "llm")
-                    span_name = span_name.format(provider=provider)
                 
                 return self.tracer.trace(
                     name=span_name, 
                     span_type=span_type,
-                    include_io=False
+                    include_io=include_io
                 )(func)(self, *args, **kwargs)
             return func(self, *args, **kwargs)
         return wrapper
@@ -34,7 +30,7 @@ def smart_trace(span_type, name=None):
 
 class RAGEngine:
 
-    def __init__(self, llm, vector_store, tracer=None, k=6, max_context_tokens=2000, distance_threshold=0.60):
+    def __init__(self, llm, vector_store, tracer=None, k=6, max_context_tokens=2000, distance_threshold=0.50):
         self.llm = llm
         self.vector_store = vector_store
         self.tracer = tracer
@@ -243,7 +239,7 @@ Rewritten Phrase:
 
             if content in seen_parents:
                 continue
-
+            
             tokens = len(self.enc.encode(content))
 
             if tokens > self.max_context_tokens:
@@ -314,7 +310,7 @@ Response:
     # Main Pipeline
     # ---------------------------------------------------------
 
-    @smart_trace(span_type="generic", name="rag-pipeline")
+    @smart_trace(span_type="generic", name="rag-pipeline", include_io=True)
     def run(self, query):
 
         intent, _ = self.classify_intent(query)

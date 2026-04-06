@@ -249,17 +249,15 @@ vector_store = get_vector_store(embeddings, index_mtime)
 def get_rag_engine_v2(model_name, _llm, _vector_store, _tracer):
     if not _vector_store:
         return None
-    return RAGEngine(_llm, _vector_store, tracer=_tracer, k=6, distance_threshold=0.60)
+    return RAGEngine(_llm, _vector_store, tracer=_tracer, k=6, distance_threshold=0.50)
 
 @st.cache_resource
-def get_sdk_tracer_v2(env, model, provider, salt="final_reboot_v11"):
+def get_sdk_tracer_v2(env, salt="final_reboot_v11"):
     return smartllmops.init(
-        environment=env, 
-        model=model, 
-        provider=provider
+        environment=env
     )
 
-sdk_tracer = get_sdk_tracer_v2("dev", selected_model, "groq")
+sdk_tracer = get_sdk_tracer_v2("dev")
 rag_engine = get_rag_engine_v2(selected_model, llm, vector_store, sdk_tracer)
 
 
