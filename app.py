@@ -254,6 +254,8 @@ def get_rag_engine_v2(model_name, _llm, _vector_store, _tracer):
 @st.cache_resource
 def get_sdk_tracer_v2(env, salt="final_reboot_v11"):
     return smartllmops.init(
+        application_name="RAG_Chatbot_Intelligence",
+        tags={"department": "AI_Research"},
         environment=env
     )
 
